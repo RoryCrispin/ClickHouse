@@ -1057,6 +1057,77 @@ SelectQueryInfo ReadFromMerge::getModifiedQueryInfo(const ContextMutablePtr & mo
         }
 
         modified_query_info.query = queryNodeToSelectQuery(modified_query_info.query_tree);
+
+        /// Rebuild filter_actions_dag to match the replacement table's column identifiers
+        /// This is necessary because the filter DAG from the original query references
+        /// the original table's columns, but we've now replaced the table expression
+        if (modified_query_info.filter_actions_dag &&
+            modified_query_info.planner_context &&
+            modified_query_info.query_tree)
+        {
+            try
+            {
+                /// Populate TableExpressionData for the replacement table with its columns
+                /// This is needed for buildNodeNameToInputNodeColumn to work correctly
+                auto & table_expression_data = modified_query_info.planner_context
+                    ->getTableExpressionDataOrThrow(replacement_table_expression);
+
+                /// Get storage columns and register them in the planner context
+                const auto & storage_columns = storage_snapshot_->metadata->getColumns().getAll();
+
+                /// Build column name to identifier mapping for the replacement table
+                for (const auto & column : storage_columns)
+                {
+                    /// Skip if column already exists in table expression data
+                    if (table_expression_data.hasColumn(column.name))
+                        continue;
+
+                    auto column_identifier = modified_query_info.planner_context
+                        ->getGlobalPlannerContext()->createColumnIdentifier(
+                            NameAndTypePair{column.name, column.type},
+                            replacement_table_expression);
+
+                    table_expression_data.addColumn(
+                        NameAndTypePair{column.name, column.type},
+                        column_identifier,
+                        false /* is_selected_column */);
+                }
+
+                /// Build the mapping from node names to input columns for the new table
+                auto node_name_to_input_node_column =
+                    modified_query_info.buildNodeNameToInputNodeColumn();
+
+                /// Rebuild the filter ActionsDAG using the original filter nodes
+                /// but with input columns mapped to the replacement table's identifiers
+                if (!node_name_to_input_node_column.empty())
+                {
+                    auto filter_output_nodes = modified_query_info.filter_actions_dag->getOutputs();
+
+                    auto rebuilt_filter = ActionsDAG::buildFilterActionsDAG(
+                        filter_output_nodes,
+                        node_name_to_input_node_column,
+                        true /* single_output_condition_node */);
+
+                    if (rebuilt_filter)
+                    {
+                        modified_query_info.filter_actions_dag =
+                            std::make_shared<const ActionsDAG>(std::move(*rebuilt_filter));
+                    }
+                }
+            }
+            catch (...)
+            {
+                /// If rebuilding fails for any reason, clear filter_actions_dag
+                /// The query will still work but won't benefit from filter pushdown optimizations
+                modified_query_info.filter_actions_dag = nullptr;
+            }
+        }
+        else if (modified_query_info.filter_actions_dag)
+        {
+            /// No planner context means we can't rebuild the filter correctly
+            /// Clear it to avoid inconsistencies
+            modified_query_info.filter_actions_dag = nullptr;
+        }
     }
     else
     {
